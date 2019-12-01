@@ -1,0 +1,22 @@
+{{ define "optin" }}
+{{ template "header" .}}
+<section>
+    <h2>Confirm</h2>
+    <p>
+        Confirm your subscriptions by clicking the below button.
+    </p>
+
+    <form method="post">
+        <p>
+            {{ range $i, $l := .Data.ListUUIDs }}
+                <input type="hidden" name="l" value="{{ $l }}" />
+            {{ end }}
+
+            <input type="hidden" name="confirm" value="true" />
+            <button type="submit" class="button" id="btn-unsub">Confirm subscriptions</button>
+        </p>
+    </form>
+</section>
+
+{{ template "footer" .}}
+{{ end }}
