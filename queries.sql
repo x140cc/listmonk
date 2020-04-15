@@ -12,6 +12,21 @@ SELECT exists (SELECT true FROM subscribers WHERE CASE WHEN $1 > 0 THEN id = $1 
 SELECT * FROM subscribers WHERE email=ANY($1);
 
 -- name: get-subscriber-lists
+WITH sub AS (
+    SELECT id FROM subscribers WHERE CASE WHEN $1 > 0 THEN id = $1 ELSE uuid = $2 END
+)
+SELECT * FROM lists
+    LEFT JOIN subscriber_lists ON (lists.id = subscriber_lists.list_id)
+    WHERE subscriber_id = (SELECT id FROM sub)
+    -- Optional list IDs or UUIDs to filter.
+    AND (CASE WHEN $3::INT[] IS NOT NULL THEN id = ANY($3::INT[])
+          WHEN $4::UUID[] IS NOT NULL THEN uuid = ANY($4::UUID[])
+          ELSE TRUE
+    END)
+    AND (CASE WHEN $5 != '' THEN subscriber_lists.status = $5::subscription_status END)
+    AND (CASE WHEN $6 != '' THEN lists.optin = $6::list_optin ELSE TRUE END);
+
+-- name: get-subscriber-lists-lazy
 -- Get lists associations of subscribers given a list of subscriber IDs.
 -- This query is used to lazy load given a list of subscriber IDs.
 -- The query returns results in the same order as the given subscriber IDs, and for non-existent subscriber IDs,
@@ -39,11 +54,16 @@ WITH sub AS (
     VALUES($1, $2, $3, $4, $5)
     returning id
 ),
+listIDs AS (
+    SELECT id FROM lists WHERE
+        (CASE WHEN ARRAY_LENGTH($6::INT[], 1) > 0 THEN id=ANY($6)
+              ELSE uuid=ANY($7::UUID[]) END)
+),
 subs AS (
     INSERT INTO subscriber_lists (subscriber_id, list_id, status)
     VALUES(
         (SELECT id FROM sub),
-        UNNEST($6::INT[]),
+        UNNEST(ARRAY(SELECT id FROM listIDs)),
         (CASE WHEN $4='blacklisted' THEN 'unsubscribed'::subscription_status ELSE 'unconfirmed' END)
     )
     ON CONFLICT (subscriber_id, list_id) DO UPDATE
@@ -130,6 +150,16 @@ INSERT INTO subscriber_lists (subscriber_id, list_id)
 DELETE FROM subscriber_lists
     WHERE (subscriber_id, list_id) = ANY(SELECT a, b FROM UNNEST($1::INT[]) a, UNNEST($2::INT[]) b);
 
+-- name: confirm-subscription-optin
+WITH subID AS (
+    SELECT id FROM subscribers WHERE uuid = $1::UUID
+),
+listIDs AS (
+    SELECT id FROM lists WHERE uuid = ANY($2::UUID[])
+)
+UPDATE subscriber_lists SET status='confirmed', updated_at=NOW()
+    WHERE subscriber_id = (SELECT id FROM subID) AND list_id = ANY(SELECT id FROM listIDs);
+
 -- name: unsubscribe-subscribers-from-lists
 UPDATE subscriber_lists SET status='unsubscribed', updated_at=NOW()
     WHERE (subscriber_id, list_id) = ANY(SELECT a, b FROM UNNEST($1::INT[]) a, UNNEST($2::INT[]) b);
@@ -155,42 +185,34 @@ UPDATE subscriber_lists SET status = 'unsubscribed' WHERE
 -- privacy
 -- name: export-subscriber-data
 WITH prof AS (
-    SELECT uuid, email, name, attribs, status, created_at, updated_at FROM subscribers WHERE
+    SELECT id, uuid, email, name, attribs, status, created_at, updated_at FROM subscribers WHERE
     CASE WHEN $1 > 0 THEN id = $1 ELSE uuid = $2 END
 ),
 subs AS (
-    SELECT JSON_AGG(
-        ROW_TO_JSON(
-            (SELECT l FROM (
-                SELECT subscriber_lists.status AS subscription_status,
-                        (CASE WHEN lists.type = 'private' THEN 'Private list' ELSE lists.name END) as name,
-                        lists.type, subscriber_lists.created_at
-            ) l)
-        )
-    ) AS lists FROM lists
+    SELECT subscriber_lists.status AS subscription_status,
+            (CASE WHEN lists.type = 'private' THEN 'Private list' ELSE lists.name END) as name,
+            lists.type, subscriber_lists.created_at
+    FROM lists
     LEFT JOIN subscriber_lists ON (subscriber_lists.list_id = lists.id)
     WHERE subscriber_lists.subscriber_id = (SELECT id FROM prof)
-    GROUP BY subscriber_id
 ),
 views AS (
-    SELECT JSON_AGG(t) AS views FROM
-    (SELECT subject as campaign, COUNT(subscriber_id) as views FROM campaign_views
-            LEFT JOIN campaigns ON (campaigns.id = campaign_views.campaign_id)
-            WHERE subscriber_id = (SELECT id FROM prof)
-            GROUP BY campaigns.id ORDER BY id) t
+    SELECT subject as campaign, COUNT(subscriber_id) as views FROM campaign_views
+        LEFT JOIN campaigns ON (campaigns.id = campaign_views.campaign_id)
+        WHERE subscriber_id = (SELECT id FROM prof)
+        GROUP BY campaigns.id ORDER BY id
 ),
 clicks AS (
-    SELECT JSON_AGG(t) AS views FROM
-    (SELECT url, COUNT(subscriber_id) as clicks FROM link_clicks
+    SELECT url, COUNT(subscriber_id) as clicks FROM link_clicks
         LEFT JOIN links ON (links.id = link_clicks.link_id)
         WHERE subscriber_id = (SELECT id FROM prof)
-        GROUP BY links.id ORDER BY id) t
+        GROUP BY links.id ORDER BY id
 )
 SELECT (SELECT email FROM prof) as email,
-        COALESCE((SELECT JSON_AGG(t) AS profile FROM prof t), '{}') AS profile,
-        COALESCE((SELECT * FROM subs), '[]') AS subscriptions,
-        COALESCE((SELECT * FROM views), '[]') AS campaign_views,
-        COALESCE((SELECT * FROM clicks), '[]') AS link_clicks;
+        COALESCE((SELECT JSON_AGG(t) FROM prof t), '{}') AS profile,
+        COALESCE((SELECT JSON_AGG(t) FROM subs t), '[]') AS subscriptions,
+        COALESCE((SELECT JSON_AGG(t) FROM views t), '[]') AS campaign_views,
+        COALESCE((SELECT JSON_AGG(t) FROM clicks t), '[]') AS link_clicks;
 
 -- Partial and RAW queries used to construct arbitrary subscriber
 -- queries for segmentation follow.
@@ -275,14 +297,22 @@ SELECT COUNT(*) OVER () AS total, lists.*, COUNT(subscriber_lists.subscriber_id)
     WHERE ($1 = 0 OR id = $1)
     GROUP BY lists.id ORDER BY lists.created_at OFFSET $2 LIMIT (CASE WHEN $3 = 0 THEN NULL ELSE $3 END);
 
+-- name: get-lists-by-optin
+-- Can have a list of IDs or a list of UUIDs.
+SELECT * FROM lists WHERE (CASE WHEN $1 != '' THEN optin=$1::list_optin ELSE TRUE END) AND
+    (CASE WHEN $2::INT[] IS NOT NULL THEN id = ANY($2::INT[])
+          WHEN $3::UUID[] IS NOT NULL THEN uuid = ANY($3::UUID[])
+    END) ORDER BY name;
+
 -- name: create-list
-INSERT INTO lists (uuid, name, type, tags) VALUES($1, $2, $3, $4) RETURNING id;
+INSERT INTO lists (uuid, name, type, optin, tags) VALUES($1, $2, $3, $4, $5) RETURNING id;
 
 -- name: update-list
 UPDATE lists SET
     name=(CASE WHEN $2 != '' THEN $2 ELSE name END),
     type=(CASE WHEN $3 != '' THEN $3::list_type ELSE type END),
-    tags=(CASE WHEN ARRAY_LENGTH($4::VARCHAR(100)[], 1) > 0 THEN $4 ELSE tags END),
+    optin=(CASE WHEN $4 != '' THEN $4::list_optin ELSE optin END),
+    tags=(CASE WHEN ARRAY_LENGTH($5::VARCHAR(100)[], 1) > 0 THEN $5 ELSE tags END),
     updated_at=NOW()
 WHERE id = $1;
 
@@ -296,22 +326,39 @@ DELETE FROM lists WHERE id = ALL($1);
 -- campaigns
 -- name: create-campaign
 -- This creates the campaign and inserts campaign_lists relationships.
-WITH counts AS (
+WITH campLists AS (
+    -- Get the list_ids and their optin statuses for the campaigns found in the previous step.
+    SELECT id AS list_id, campaign_id, optin FROM lists
+    INNER JOIN campaign_lists ON (campaign_lists.list_id = lists.id)
+    WHERE id=ANY($12::INT[])
+),
+tpl AS (
+    -- If there's no template_id given, use the defualt template.
+    SELECT (CASE WHEN $11 = 0 THEN id ELSE $11 END) AS id FROM templates WHERE is_default IS TRUE
+),
+counts AS (
     SELECT COALESCE(COUNT(id), 0) as to_send, COALESCE(MAX(id), 0) as max_sub_id
     FROM subscribers
-    LEFT JOIN subscriber_lists ON (subscribers.id = subscriber_lists.subscriber_id)
-    WHERE subscriber_lists.list_id=ANY($11::INT[])
+    LEFT JOIN campLists ON (campLists.campaign_id = ANY($12::INT[]))
+    LEFT JOIN subscriber_lists ON (
+        subscriber_lists.status != 'unsubscribed' AND
+        subscribers.id = subscriber_lists.subscriber_id AND
+        subscriber_lists.list_id = campLists.list_id AND
+
+        -- For double opt-in lists, consider only 'confirmed' subscriptions. For single opt-ins,
+        -- any status except for 'unsubscribed' (already excluded above) works.
+        (CASE WHEN campLists.optin = 'double' THEN subscriber_lists.status = 'confirmed' ELSE true END)
+    )
+    WHERE subscriber_lists.list_id=ANY($12::INT[])
     AND subscribers.status='enabled'
 ),
 camp AS (
-    INSERT INTO campaigns (uuid, name, subject, from_email, body, content_type, send_at, tags, messenger, template_id, to_send, max_subscriber_id)
-        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                (SELECT to_send FROM counts),
-                (SELECT max_sub_id FROM counts)
+    INSERT INTO campaigns (uuid, type, name, subject, from_email, body, content_type, send_at, tags, messenger, template_id, to_send, max_subscriber_id)
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, (SELECT id FROM tpl), (SELECT to_send FROM counts), (SELECT max_sub_id FROM counts)
         RETURNING id
 )
 INSERT INTO campaign_lists (campaign_id, list_id, list_name)
-    (SELECT (SELECT id FROM camp), id, name FROM lists WHERE id=ANY($11::INT[]))
+    (SELECT (SELECT id FROM camp), id, name FROM lists WHERE id=ANY($12::INT[]))
     RETURNING (SELECT id FROM camp);
 
 -- name: query-campaigns
@@ -395,24 +442,46 @@ WITH camps AS (
     SELECT campaigns.*, COALESCE(templates.body, (SELECT body FROM templates WHERE is_default = true LIMIT 1)) AS template_body
     FROM campaigns
     LEFT JOIN templates ON (templates.id = campaigns.template_id)
-    WHERE (status='running' OR (status='scheduled' AND campaigns.send_at >= NOW()))
+    WHERE (status='running' OR (status='scheduled' AND NOW() >= campaigns.send_at))
     AND NOT(campaigns.id = ANY($1::INT[]))
 ),
-counts AS (
-    -- For each campaign above, get the total number of subscribers and the max_subscriber_id across all its lists.
-    SELECT id AS campaign_id, COUNT(subscriber_lists.subscriber_id) AS to_send,
-        COALESCE(MAX(subscriber_lists.subscriber_id), 0) AS max_subscriber_id FROM camps
-    LEFT JOIN campaign_lists ON (campaign_lists.campaign_id = camps.id)
-    LEFT JOIN subscriber_lists ON (subscriber_lists.list_id = campaign_lists.list_id AND subscriber_lists.status != 'unsubscribed')
+campLists AS (
+    -- Get the list_ids and their optin statuses for the campaigns found in the previous step.
+    SELECT id AS list_id, campaign_id, optin FROM lists
+    INNER JOIN campaign_lists ON (campaign_lists.list_id = lists.id)
     WHERE campaign_lists.campaign_id = ANY(SELECT id FROM camps)
+),
+counts AS (
+    -- For each campaign above, get the total number of subscribers and the max_subscriber_id
+    -- across all its lists.
+    SELECT id AS campaign_id,
+                 COUNT(DISTINCT(subscriber_lists.subscriber_id)) AS to_send,
+                 COALESCE(MAX(subscriber_lists.subscriber_id), 0) AS max_subscriber_id
+    FROM camps
+    LEFT JOIN campLists ON (campLists.campaign_id = camps.id)
+    LEFT JOIN subscriber_lists ON (
+        subscriber_lists.list_id = campLists.list_id AND
+        (CASE
+            -- For optin campaigns, only e-mail 'unconfirmed' subscribers belonging to 'double' optin lists.
+            WHEN camps.type = 'optin' THEN subscriber_lists.status = 'unconfirmed' AND campLists.optin = 'double'
+
+            -- For regular campaigns with double optin lists, only e-mail 'confirmed' subscribers.
+            WHEN campLists.optin = 'double' THEN subscriber_lists.status = 'confirmed'
+
+            -- For regular campaigns with non-double optin lists, e-mail everyone
+            -- except unsubscribed subscribers.
+            ELSE subscriber_lists.status != 'unsubscribed'
+        END)
+    )
     GROUP BY camps.id
 ),
 u AS (
-    -- For each campaign above, update the to_send count.
+    -- For each campaign, update the to_send count and set the max_subscriber_id.
     UPDATE campaigns AS ca
     SET to_send = co.to_send,
-    max_subscriber_id = co.max_subscriber_id,
-    started_at=(CASE WHEN ca.started_at IS NULL THEN NOW() ELSE ca.started_at END)
+        status = (CASE WHEN status != 'running' THEN 'running' ELSE status END),
+        max_subscriber_id = co.max_subscriber_id,
+        started_at=(CASE WHEN ca.started_at IS NULL THEN NOW() ELSE ca.started_at END)
     FROM (SELECT * FROM counts) co
     WHERE ca.id = co.campaign_id
 )
@@ -422,27 +491,47 @@ SELECT * FROM camps;
 -- Returns a batch of subscribers in a given campaign starting from the last checkpoint
 -- (last_subscriber_id). Every fetch updates the checkpoint and the sent count, which means
 -- every fetch returns a new batch of subscribers until all rows are exhausted.
-WITH camp AS (
-    SELECT last_subscriber_id, max_subscriber_id
+WITH camps AS (
+    SELECT last_subscriber_id, max_subscriber_id, type
     FROM campaigns
     WHERE id=$1 AND status='running'
 ),
+campLists AS (
+    SELECT id AS list_id, optin FROM lists
+    INNER JOIN campaign_lists ON (campaign_lists.list_id = lists.id)
+    WHERE campaign_lists.campaign_id = $1
+),
 subs AS (
-    SELECT DISTINCT ON(id) id AS uniq_id, * FROM subscribers
-    LEFT JOIN subscriber_lists ON (subscribers.id = subscriber_lists.subscriber_id AND subscriber_lists.status != 'unsubscribed')
-    WHERE subscriber_lists.list_id=ANY(
-        SELECT list_id FROM campaign_lists where campaign_id=$1 AND list_id IS NOT NULL
+    SELECT DISTINCT ON(subscribers.id) id AS uniq_id, subscribers.* FROM subscriber_lists
+    INNER JOIN campLists ON (
+        campLists.list_id = subscriber_lists.list_id
     )
-    AND subscribers.status != 'blacklisted'
-    AND id > (SELECT last_subscriber_id FROM camp)
-    AND id <= (SELECT max_subscriber_id FROM camp)
+    INNER JOIN subscribers ON (
+        subscribers.status != 'blacklisted' AND
+        subscribers.id = subscriber_lists.subscriber_id AND
+
+        (CASE
+            -- For optin campaigns, only e-mail 'unconfirmed' subscribers.
+            WHEN (SELECT type FROM camps) = 'optin' THEN subscriber_lists.status = 'unconfirmed' AND campLists.optin = 'double'
+
+            -- For regular campaigns with double optin lists, only e-mail 'confirmed' subscribers.
+            WHEN campLists.optin = 'double' THEN subscriber_lists.status = 'confirmed'
+
+            -- For regular campaigns with non-double optin lists, e-mail everyone
+            -- except unsubscribed subscribers.
+            ELSE subscriber_lists.status != 'unsubscribed'
+        END)
+    )
+    WHERE subscriber_lists.status != 'unsubscribed' AND
+    id > (SELECT last_subscriber_id FROM camps) AND
+    id <= (SELECT max_subscriber_id FROM camps)
     ORDER BY id LIMIT $2
 ),
 u AS (
     UPDATE campaigns
-    SET last_subscriber_id=(SELECT MAX(id) FROM subs),
-        sent=sent + (SELECT COUNT(id) FROM subs),
-        updated_at=NOW()
+    SET last_subscriber_id = (SELECT MAX(id) FROM subs),
+        sent = sent + (SELECT COUNT(id) FROM subs),
+        updated_at = NOW()
     WHERE (SELECT COUNT(id) FROM subs) > 0 AND id=$1
 )
 SELECT * FROM subs;

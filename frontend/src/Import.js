@@ -436,7 +436,6 @@ class Import extends React.PureComponent {
             <code className="csv-headers">
               <span>email,</span>
               <span>name,</span>
-              <span>status,</span>
               <span>attributes</span>
             </code>
           </blockquote>
@@ -446,19 +445,16 @@ class Import extends React.PureComponent {
             <code className="csv-headers">
               <span>email,</span>
               <span>name,</span>
-              <span>status,</span>
               <span>attributes</span>
             </code>
             <code className="csv-row">
               <span>user1@mail.com,</span>
               <span>"User One",</span>
-              <span>enabled,</span>
               <span>{'"{""age"": 32, ""city"": ""Bangalore""}"'}</span>
             </code>
             <code className="csv-row">
               <span>user2@mail.com,</span>
               <span>"User Two",</span>
-              <span>blacklisted,</span>
               <span>
                 {'"{""age"": 25, ""occupation"": ""Time Traveller""}"'}
               </span>

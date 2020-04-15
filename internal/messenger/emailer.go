@@ -1,26 +1,36 @@
 package messenger
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/smtp"
 	"time"
 
+	"github.com/jaytaylor/html2text"
 	"github.com/jordan-wright/email"
 )
 
 const emName = "email"
 
+// loginAuth is used for enabling SMTP "LOGIN" auth.
+type loginAuth struct {
+	username string
+	password string
+}
+
 // Server represents an SMTP server's credentials.
 type Server struct {
-	Name         string
-	Host         string        `koanf:"host"`
-	Port         int           `koanf:"port"`
-	AuthProtocol string        `koanf:"auth_protocol"`
-	Username     string        `koanf:"username"`
-	Password     string        `koanf:"password"`
-	SendTimeout  time.Duration `koanf:"send_timeout"`
-	MaxConns     int           `koanf:"max_conns"`
+	Name          string
+	Host          string        `koanf:"host"`
+	Port          int           `koanf:"port"`
+	AuthProtocol  string        `koanf:"auth_protocol"`
+	Username      string        `koanf:"username"`
+	Password      string        `koanf:"password"`
+	EmailFormat   string        `koanf:"email_format"`
+	HelloHostname string        `koanf:"hello_hostname"`
+	SendTimeout   time.Duration `koanf:"send_timeout"`
+	MaxConns      int           `koanf:"max_conns"`
 
 	mailer *email.Pool
 }
@@ -41,15 +51,26 @@ func NewEmailer(srv ...Server) (Messenger, error) {
 	for _, server := range srv {
 		s := server
 		var auth smtp.Auth
-		if s.AuthProtocol == "cram" {
+		switch s.AuthProtocol {
+		case "cram":
 			auth = smtp.CRAMMD5Auth(s.Username, s.Password)
-		} else {
+		case "plain":
 			auth = smtp.PlainAuth("", s.Username, s.Password, s.Host)
+		case "login":
+			auth = &loginAuth{username: s.Username, password: s.Password}
+		case "":
+		default:
+			return nil, fmt.Errorf("unknown SMTP auth typer '%s'", s.AuthProtocol)
 		}
 
 		pool, err := email.NewPool(fmt.Sprintf("%s:%d", s.Host, s.Port), s.MaxConns, auth)
 		if err != nil {
 			return nil, err
+		}
+
+		// Optional SMTP HELLO hostname.
+		if server.HelloHostname != "" {
+			pool.SetHelloHostname(server.HelloHostname)
 		}
 
 		s.mailer = pool
@@ -93,19 +114,53 @@ func (e *emailer) Push(fromAddr string, toAddr []string, subject string, m []byt
 		}
 	}
 
+	mtext, err := html2text.FromString(string(m), html2text.Options{PrettyTables: true})
+	if err != nil {
+		return err
+	}
+
 	srv := e.servers[key]
-	err := srv.mailer.Send(&email.Email{
+	em := &email.Email{
 		From:        fromAddr,
 		To:          toAddr,
 		Subject:     subject,
-		HTML:        m,
 		Attachments: files,
-	}, srv.SendTimeout)
+	}
 
-	return err
+	switch srv.EmailFormat {
+	case "html":
+		em.HTML = m
+	case "plain":
+		em.Text = []byte(mtext)
+	default:
+		em.HTML = m
+		em.Text = []byte(mtext)
+	}
+
+	return srv.mailer.Send(em, srv.SendTimeout)
 }
 
 // Flush flushes the message queue to the server.
 func (e *emailer) Flush() error {
 	return nil
+}
+
+// https://gist.github.com/andelf/5118732
+// Adds support for SMTP LOGIN auth.
+func (a *loginAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	return "LOGIN", []byte{}, nil
+}
+
+func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		switch string(fromServer) {
+		case "Username:":
+			return []byte(a.username), nil
+		case "Password:":
+			return []byte(a.password), nil
+		default:
+			return nil, errors.New("unkown SMTP fromServer")
+		}
+	}
+	return nil, nil
 }

@@ -14,17 +14,31 @@ listmonk is a standalone, self-hosted, newsletter and mailing list manager. It i
 - Run `./listmonk` and visit `http://localhost:9000`.
 - Since there is no user auth yet, it's best to put listmonk behind a proxy like Nginx and setup basicauth on all endpoints except for the few endpoints that need to be public. Here is a [sample nginx config](https://github.com/knadh/listmonk/wiki/Production-Nginx-config) for production use.
 
+### Configuration and customization
+See the [configuration Wiki page](https://github.com/knadh/listmonk/wiki/Configuration).
+
 ### Running on Docker
 
 You can pull the official Docker Image from [Docker Hub](https://hub.docker.com/r/listmonk/listmonk).
 
-You can checkout the [docker-compose.yml](docker-compose.yml) to get an idea of how to run `listmonk` with `PostgreSQL` together using Docker.
+You can checkout the [docker-compose.yml](docker-compose.yml) to get an idea of how to run `listmonk` with `PostgreSQL` together using Docker (also see [configuring with environment variables](https://github.com/knadh/listmonk/wiki/Configuration)).
 
 - `docker-compose up -d app db` to run all the services together.
 - `docker-compose run --rm app ./listmonk --install` to setup the DB.
 - Visit `http://localhost:9000`.
 
 Alternatively, to run a demo of listmonk, you can quickly spin up a container `docker-compose up -d demo-db demo-app`. NOTE: This doesn't persist Postgres data after you stop and remove the container, this setup is intended only for demo. _DO NOT_ use the demo setup in production.
+
+### Other deployments
+
+#### Heroku 
+
+Using the [Nginx buildpack](https://github.com/heroku/heroku-buildpack-nginx) can be used to deploy listmonk on Heroku and use Nginx as a proxy to setup basicauth. 
+This one-click [Heroku deploy button](https://github.com/bumi/listmonk-heroku) provides an automated default deployment.
+
+[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/bumi/listmonk-heroku)
+
+Please note that [configuration options](https://github.com/knadh/listmonk/wiki/Configuration) must be set using [environment configruation variables](https://devcenter.heroku.com/articles/config-vars).
 
 ### Help and docs
 
@@ -33,12 +47,13 @@ Alternatively, to run a demo of listmonk, you can quickly spin up a container `d
 ### Current features
 
 - Admin dashboard
-- Multiple public and private lists
+- Public, private, single and double optin lists (with optin campaigns)
 - Fast bulk subscriber import
 - Custom subscriber attributes
-- Subscriber querying and segmentation with ad-hoc SQL
-- Rich Go HTML templates and WYSIWYG editor
-- Media gallery
+- Subscriber querying and segmentation with ad-hoc SQL expressions
+- Subscriber data wipe / export privacy features
+- Rich programmable Go HTML templates and WYSIWYG editor
+- Media gallery (disk and S3 storage)
 - Multi-threaded multi-SMTP e-mail queues for fast campaign delivery
 - HTTP/JSON APIs for everything
 - Clicks and view tracking
